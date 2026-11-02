@@ -3,10 +3,13 @@
 # custom edits you make here. Review the PR diff before merging.
 name: "Deploy to Production"
 # LaneSync records a production deployment only for the verified candidate: keep the full
-# candidate SHA in the run name (this workflow runs on its own ref, not on the candidate).
-run-name: "Deploy ${{ inputs.release_version }} (${{ inputs.candidate_sha }})"
+# candidate SHA in the run name. A dispatch runs on its own ref and names the candidate in its
+# inputs; a GitHub deployment that LaneSync creates (as the person who pressed Deploy) carries it.
+run-name: "Deploy ${{ inputs.release_version || github.event.deployment.payload.lanesync.release_version }} (${{ inputs.candidate_sha || github.event.deployment.sha }})"
 
 on:
+  # LaneSync's Deploy button creates a GitHub deployment of the approved candidate as the signed-in person.
+  deployment:
   workflow_dispatch:
     inputs:
       release_version:
@@ -21,18 +24,35 @@ on:
 permissions:
   contents: read
   id-token: write
+  # Only to report this run's progress on the deployment that started it.
+  deployments: write
 
 jobs:
   deploy-production:
     name: "Deploy to Production"
+    # A deployment starts this only when it is LaneSync's, for this environment and for its own commit.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.deployment.environment == 'production' &&
+      github.event.deployment.payload.lanesync.candidate_sha == github.event.deployment.sha)
     runs-on: ubuntu-latest
     environment: production
+    env:
+      RELEASE_VERSION: ${{ inputs.release_version || github.event.deployment.payload.lanesync.release_version }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha || github.event.deployment.sha }}
     steps:
+      - name: Report deployment in progress
+        if: github.event_name == 'deployment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUSES_URL: ${{ github.event.deployment.statuses_url }}
+          LOG_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          curl --fail --silent --show-error -X POST -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${STATUSES_URL}" -d "$(jq -n --arg log "$LOG_URL" '{state: "in_progress", log_url: $log}')" >/dev/null
       - name: Verify LaneSync deployment gate for this commit
         env:
           LANESYNC_API_URL: "https://unrelishable-erika-nonfactiously.ngrok-free.dev"
-          RELEASE_VERSION: ${{ github.event.inputs.release_version }}
-          CANDIDATE_SHA: ${{ github.event.inputs.candidate_sha }}
           REPOSITORY: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
@@ -57,10 +77,21 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.inputs.candidate_sha }}
+          ref: ${{ env.CANDIDATE_SHA }}
 
       # Replace with your real production deployment; this starter deliberately fails until configured.
       - name: Configure production deployment
         run: |
           echo "Configure real production deployment commands before enabling this workflow." >&2
           exit 1
+
+      - name: Report deployment result
+        if: always() && github.event_name == 'deployment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUSES_URL: ${{ github.event.deployment.statuses_url }}
+          LOG_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: |
+          curl --fail --silent --show-error -X POST -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "${STATUSES_URL}" -d "$(jq -n --arg state "$STATE" --arg log "$LOG_URL" '{state: $state, log_url: $log}')" >/dev/null
